@@ -16,14 +16,17 @@ app = Flask(__name__)
 CORS(app)
 
 # --- CONFIGURATION ---
-# 1. Get Gemini API Key from Environment Variable
+# 1. Gemini API Key (Required for text processing)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# 2. Get Google Drive Credentials from Environment Variable
-# We expect the JSON content to be pasted into an env var named 'GOOGLE_CREDENTIALS_JSON'
+# 2. Google Drive Auth (Choose ONE method)
+# Method A: Service Account (Secure, for private folders)
 GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+# Method B: API Key (Easier, but folder MUST be Public)
+DRIVE_API_KEY = os.environ.get("DRIVE_API_KEY")
+
 ROOT_FOLDER_NAME = "ISL Dictionary" 
 IGNORED_FOLDERS = ["MHSL - 259", "New 2500 ISL Dictionary Videos", "NCERT 156 new"]
 
@@ -31,6 +34,8 @@ drive_service = None
 
 def setup_drive():
     global drive_service
+    
+    # Try Method A: Service Account (Best for production)
     if GOOGLE_CREDENTIALS_JSON:
         try:
             creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
@@ -38,9 +43,21 @@ def setup_drive():
                 creds_dict, scopes=['https://www.googleapis.com/auth/drive.readonly']
             )
             drive_service = build('drive', 'v3', credentials=creds)
-            print("✅ Google Drive Service Authenticated.")
+            print("✅ Google Drive Authenticated (Service Account)")
+            return
         except Exception as e:
-            print(f"❌ Auth Error: {e}")
+            print(f"⚠️ Service Account Auth failed: {e}")
+
+    # Try Method B: Simple API Key
+    if DRIVE_API_KEY:
+        try:
+            drive_service = build('drive', 'v3', developerKey=DRIVE_API_KEY)
+            print("✅ Google Drive Authenticated (API Key)")
+            return
+        except Exception as e:
+            print(f"⚠️ API Key Auth failed: {e}")
+
+    print("❌ No valid Google Drive authentication found.")
 
 setup_drive()
 
@@ -48,14 +65,19 @@ setup_drive()
 
 def find_folder_id(folder_name, parent_id=None):
     if not drive_service: return None
+    # Note: 'trashed=false' ensures we don't get deleted folders
     query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
     if parent_id: query += f" and '{parent_id}' in parents"
-    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get('files', [])
-    return files[0]['id'] if files else None
+    
+    try:
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        files = results.get('files', [])
+        return files[0]['id'] if files else None
+    except Exception as e:
+        print(f"Search Error: {e}")
+        return None
 
 ROOT_FOLDER_ID = None
-# We initialize this lazily or on startup if credentials exist
 if drive_service:
     ROOT_FOLDER_ID = find_folder_id(ROOT_FOLDER_NAME)
 
@@ -73,21 +95,26 @@ def get_all_files_in_folder(folder_id):
     files_map = {}
     page_token = None
     while True:
-        response = drive_service.files().list(
-            q=f"'{folder_id}' in parents and mimeType contains 'video' and trashed=false",
-            fields="nextPageToken, files(id, name, webViewLink)",
-            pageSize=1000, pageToken=page_token
-        ).execute()
-        for f in response.get('files', []):
-            files_map[f['name']] = {'link': f['webViewLink'], 'id': f['id']}
-        page_token = response.get('nextPageToken')
-        if not page_token: break
+        try:
+            response = drive_service.files().list(
+                q=f"'{folder_id}' in parents and mimeType contains 'video' and trashed=false",
+                fields="nextPageToken, files(id, name, webViewLink)",
+                pageSize=1000, pageToken=page_token
+            ).execute()
+            for f in response.get('files', []):
+                files_map[f['name']] = {'link': f['webViewLink'], 'id': f['id']}
+            page_token = response.get('nextPageToken')
+            if not page_token: break
+        except Exception as e:
+            print(f"File List Error: {e}")
+            break
     return files_map
 
 def pick_best_file(word, filenames):
     if not filenames: return None
     model = genai.GenerativeModel('gemini-2.0-flash')
-    files_str = "\n".join(filenames[:300]) # Limit to avoid token limits
+    # Limit filenames to prevent token overflow
+    files_str = "\n".join(filenames[:300]) 
     prompt = f"""
     Find best video match for ISL word: "{word}" from list below.
     Prioritize exact matches. Return "NONE" if no good match.
@@ -102,14 +129,11 @@ def create_placeholder_image(text):
     img = Image.new('RGB', (width, height), (0, 0, 0))
     d = ImageDraw.Draw(img)
     
-    # Load font - fallback to default if system font missing
     try:
         font = ImageFont.truetype("arial.ttf", 100)
     except IOError:
         font = ImageFont.load_default()
 
-    # Calculate text position (approximate centering since load_default has limited size)
-    # Using basic centering for safety
     d.text((width/2, height/2), text, fill=(255, 255, 255), anchor="mm", font=font)
     
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
@@ -136,15 +160,21 @@ def search_video_smart(word, root_id):
     return None
 
 def download_drive_video(file_id):
-    request = drive_service.files().get_media(fileId=file_id)
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    fh = io.FileIO(temp_file.name, 'wb')
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while done is False:
-        status, done = downloader.next_chunk()
-    fh.close()
-    return temp_file.name
+    # If using API Key (Public Folder), we can try direct download link generation
+    # or use the same get_media method. get_media usually works if file is public.
+    try:
+        request = drive_service.files().get_media(fileId=file_id)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        fh = io.FileIO(temp_file.name, 'wb')
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while done is False:
+            status, done = downloader.next_chunk()
+        fh.close()
+        return temp_file.name
+    except Exception as e:
+        print(f"Download Error: {e}")
+        raise e
 
 # --- ROUTES ---
 
@@ -157,9 +187,9 @@ def process_sign():
     cleanup_files = []
     try:
         if not drive_service:
-            return jsonify({"error": "Server Misconfiguration: Google Drive not authenticated."}), 500
+            return jsonify({"error": "Server Error: Google Drive not connected."}), 500
         if not ROOT_FOLDER_ID:
-            return jsonify({"error": "Server Misconfiguration: ISL Dictionary folder not found."}), 500
+            return jsonify({"error": "Server Error: 'ISL Dictionary' folder not found."}), 500
 
         data = request.json
         text = data.get('text', '')
@@ -168,18 +198,15 @@ def process_sign():
         glosses = get_isl_glosses(text)
         sequence = []
 
-        # 1. Search Phase
         for word in glosses:
             res = search_video_smart(word, ROOT_FOLDER_ID)
             if res:
                 sequence.append({'type': 'video', 'id': res['id'], 'word': word})
             else:
-                # Create Image
                 img_path = create_placeholder_image(word)
                 sequence.append({'type': 'image', 'path': img_path, 'word': word})
                 cleanup_files.append(img_path)
 
-        # 2. Assembly Phase
         clips = []
         for item in sequence:
             if item['type'] == 'video':
@@ -194,14 +221,12 @@ def process_sign():
         if not clips:
             return jsonify({"error": "No content found"}), 400
 
-        # 3. Stitching
         final_clip = concatenate_videoclips(clips, method="compose")
         output_path = tempfile.mktemp(suffix=".mp4")
         cleanup_files.append(output_path)
         
         final_clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac', temp_audiofile='temp-audio.m4a', remove_temp=True)
 
-        # Send file and then trigger cleanup (OS usually cleans temp, but good to be explicit if possible)
         return send_file(output_path, mimetype='video/mp4')
 
     except Exception as e:
@@ -210,11 +235,9 @@ def process_sign():
         return jsonify({"error": str(e)}), 500
     
     finally:
-        # Note: In production, you might want to use a background task to clean up files 
-        # AFTER the request is sent. For now, OS temp folder management handles mostly.
+        # In a real app, implement a cleanup scheduler here
         pass
 
 if __name__ == '__main__':
-    # Render sets the PORT env var
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
