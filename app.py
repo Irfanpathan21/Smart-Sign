@@ -1,16 +1,22 @@
 import os
 import json
 import tempfile
-import glob
 from flask import Flask, request, send_file, jsonify, render_template
 from flask_cors import CORS
 import google.generativeai as genai
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from google.oauth2 import service_account
 from moviepy.editor import VideoFileClip, ImageClip, concatenate_videoclips
-from PIL import Image, ImageDraw, ImageFont
+import PIL.Image
+from PIL import ImageDraw, ImageFont
 import io
+
+# --- 🟢 CRITICAL FIX FOR RENDER 🟢 ---
+# This forces the code to work with NEW Pillow versions (which Render installs)
+# by creating a fake 'ANTIALIAS' attribute that MoviePy needs.
+if not hasattr(PIL.Image, 'ANTIALIAS'):
+    PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
+# -------------------------------------
 
 app = Flask(__name__)
 CORS(app)
@@ -20,228 +26,161 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Authentication
-GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+# Use API Key (Simpler method)
 DRIVE_API_KEY = os.environ.get("DRIVE_API_KEY")
-
-# Get Folder ID directly
-ROOT_FOLDER_ID = os.environ.get("ROOT_FOLDER_ID") 
-ROOT_FOLDER_NAME = "ISL Dictionary" 
+ROOT_FOLDER_ID = os.environ.get("ROOT_FOLDER_ID")
 IGNORED_FOLDERS = ["MHSL - 259", "New 2500 ISL Dictionary Videos", "NCERT 156 new"]
 
 drive_service = None
 
 def setup_drive():
     global drive_service
-    if GOOGLE_CREDENTIALS_JSON:
-        try:
-            creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-            creds = service_account.Credentials.from_service_account_info(
-                creds_dict, scopes=['https://www.googleapis.com/auth/drive.readonly']
-            )
-            drive_service = build('drive', 'v3', credentials=creds)
-            print("✅ Google Drive Authenticated (Service Account)")
-            return
-        except Exception as e:
-            print(f"⚠️ Service Account Auth failed: {e}")
-
     if DRIVE_API_KEY:
         try:
+            # developerKey is the simple API Key method
             drive_service = build('drive', 'v3', developerKey=DRIVE_API_KEY)
             print("✅ Google Drive Authenticated (API Key)")
-            return
         except Exception as e:
-            print(f"⚠️ API Key Auth failed: {e}")
-
-    print("❌ No valid Google Drive authentication found.")
+            print(f"⚠️ Auth Failed: {e}")
+    else:
+        print("❌ No API Key found in Environment Variables")
 
 setup_drive()
 
-# --- HELPER FUNCTIONS ---
-
-def find_folder_id(folder_name, parent_id=None):
-    if not drive_service: return None
-    query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
-    if parent_id: query += f" and '{parent_id}' in parents"
-    
-    try:
-        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-        files = results.get('files', [])
-        return files[0]['id'] if files else None
-    except Exception as e:
-        print(f"Search Error: {e}")
-        return None
-
-if not ROOT_FOLDER_ID and drive_service:
-    print("⚠️ ROOT_FOLDER_ID not found in Env. Attempting to search by name...")
-    ROOT_FOLDER_ID = find_folder_id(ROOT_FOLDER_NAME)
-else:
-    print(f"✅ Using configured Root Folder ID: {ROOT_FOLDER_ID}")
-
+# --- HELPERS ---
 
 def get_isl_glosses(text):
     model = genai.GenerativeModel('gemini-2.0-flash')
-    
     # Multilingual Prompt
     prompt = f"""
     Act as an Indian Sign Language (ISL) translator.
-    
-    Step 1: If the input is in an Indian language (Hindi, Marathi, Tamil, etc.), TRANSLATE it to simple English.
-    Step 2: Convert that English sentence into ISL Glosses (Keywords).
-    
-    Rules for ISL Glosses:
-    - Keep only main content words (Nouns, Verbs, Adjectives).
-    - Remove grammar words (is, am, are, to, the, a, an).
-    - Convert verbs to their root form (e.g., "Running" -> "RUN").
-    - Output MUST be a single line of uppercase words separated by commas.
-    
+    Step 1: If input is Hindi/Marathi/Tamil/etc, TRANSLATE to simple English.
+    Step 2: Convert to ISL Glosses (Keywords).
+    Rules: Keep only content words (Nouns, Verbs). Root verbs. Uppercase. Comma separated.
     Input: "{text}"
-    Output (Keywords only):
+    Output:
     """
-    
-    response = model.generate_content(prompt)
-    return [w.strip() for w in response.text.replace('\n', '').split(',') if w.strip()]
-
-def get_all_files_in_folder(folder_id):
-    files_map = {}
-    page_token = None
-    while True:
-        try:
-            response = drive_service.files().list(
-                q=f"'{folder_id}' in parents and mimeType contains 'video' and trashed=false",
-                fields="nextPageToken, files(id, name, webViewLink)",
-                pageSize=1000, pageToken=page_token
-            ).execute()
-            for f in response.get('files', []):
-                files_map[f['name']] = {'link': f['webViewLink'], 'id': f['id']}
-            page_token = response.get('nextPageToken')
-            if not page_token: break
-        except Exception as e:
-            print(f"File List Error: {e}")
-            break
-    return files_map
-
-def pick_best_file(word, filenames):
-    if not filenames: return None
-    model = genai.GenerativeModel('gemini-2.0-flash')
-    files_str = "\n".join(filenames[:300]) 
-    prompt = f"""
-    Find best video match for ISL word: "{word}" from list below.
-    Prioritize exact matches. Return "NONE" if no good match.
-    Return ONLY the filename.
-    ---\n{files_str}\n---
-    """
-    resp = model.generate_content(prompt).text.strip().replace("'", "").replace('"', "")
-    return resp if resp in filenames else None
-
-def create_placeholder_image(text):
-    width, height = 1280, 720
-    img = Image.new('RGB', (width, height), (0, 0, 0))
-    d = ImageDraw.Draw(img)
     try:
-        font = ImageFont.truetype("arial.ttf", 100)
-    except IOError:
-        font = ImageFont.load_default()
+        response = model.generate_content(prompt)
+        return [w.strip() for w in response.text.replace('\n', '').split(',') if w.strip()]
+    except:
+        return []
 
-    d.text((width/2, height/2), text, fill=(255, 255, 255), anchor="mm", font=font)
+def find_file_in_folder(word, folder_id):
+    """Searches for a video inside the specific folder ID provided"""
+    if not drive_service or not folder_id: return None
     
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    img.save(temp_file.name)
-    return temp_file.name
+    # 1. First find the letter subfolder (e.g., 'A' for Apple)
+    first_char = word[0].upper()
+    subfolder_name = first_char if first_char.isalpha() else "Numbers"
+    
+    try:
+        # Find subfolder
+        q_folder = f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and name='{subfolder_name}' and trashed=false"
+        res_folder = drive_service.files().list(q=q_folder, fields="files(id)").execute()
+        folders = res_folder.get('files', [])
+        
+        if not folders: return None
+        subfolder_id = folders[0]['id']
 
-def search_video_smart(word, root_id):
-    if not drive_service or not root_id: return None
-    first = word[0].upper()
-    sub = first if first.isalpha() else ("Numbers" if first.isdigit() else "A")
-    if sub in IGNORED_FOLDERS: return None
+        # 2. Search for the word video inside that subfolder
+        # We search strictly for the name to avoid grabbing wrong files
+        q_file = f"'{subfolder_id}' in parents and mimeType contains 'video' and name contains '{word}' and trashed=false"
+        res_file = drive_service.files().list(q=q_file, fields="files(id, name)", pageSize=5).execute()
+        files = res_file.get('files', [])
 
-    sid = find_folder_id(sub, parent_id=root_id)
-    if not sid: return None
+        # Simple Logic: Pick the first one that looks like a match
+        # (You can make this smarter later, but this is robust for now)
+        for f in files:
+            if word in f['name'].upper():
+                return {'id': f['id'], 'type': 'video'}
+        
+        return None
+    except Exception as e:
+        print(f"Search Error for {word}: {e}")
+        return None
 
-    fmap = get_all_files_in_folder(sid)
-    if not fmap: return None
+def create_placeholder(text):
+    try:
+        width, height = 1280, 720
+        img = PIL.Image.new('RGB', (width, height), (0, 0, 0))
+        d = ImageDraw.Draw(img)
+        # Default font
+        font = ImageFont.load_default()
+        # Draw text in center
+        d.text((width/2, height/2), text, fill="white", anchor="mm")
+        
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        img.save(temp.name)
+        return temp.name
+    except Exception as e:
+        print(f"Image Gen Error: {e}")
+        return None
 
-    best = pick_best_file(word, list(fmap.keys()))
-    if best:
-        data = fmap[best]
-        data['type'] = 'video'
-        return data
-    return None
-
-def download_drive_video(file_id):
+def download_video(file_id):
     try:
         request = drive_service.files().get_media(fileId=file_id)
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        fh = io.FileIO(temp_file.name, 'wb')
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        fh = io.FileIO(temp.name, 'wb')
         downloader = MediaIoBaseDownload(fh, request)
         done = False
-        while done is False:
+        while not done:
             status, done = downloader.next_chunk()
         fh.close()
-        return temp_file.name
-    except Exception as e:
-        print(f"Download Error: {e}")
-        raise e
+        return temp.name
+    except:
+        return None
+
+# --- ROUTES ---
 
 @app.route('/')
-def index():
+def home():
     return render_template('index.html')
 
 @app.route('/process_sign', methods=['POST'])
-def process_sign():
-    cleanup_files = []
+def process():
     try:
-        if not drive_service:
-            return jsonify({"error": "Server Error: Google Drive not connected."}), 500
-        if not ROOT_FOLDER_ID:
-            return jsonify({"error": "Server Error: 'ROOT_FOLDER_ID' not set in Env Vars."}), 500
+        if not drive_service or not ROOT_FOLDER_ID:
+            return jsonify({"error": "Server Config Error: Check API Keys"}), 500
 
-        data = request.json
-        text = data.get('text', '')
-        print(f"Processing: {text}")
-
+        text = request.json.get('text', '')
         glosses = get_isl_glosses(text)
-        print(f"Glosses: {glosses}") 
-        sequence = []
-
-        for word in glosses:
-            res = search_video_smart(word, ROOT_FOLDER_ID)
-            if res:
-                sequence.append({'type': 'video', 'id': res['id'], 'word': word})
-            else:
-                img_path = create_placeholder_image(word)
-                sequence.append({'type': 'image', 'path': img_path, 'word': word})
-                cleanup_files.append(img_path)
+        print(f"Glosses: {glosses}")
 
         clips = []
-        for item in sequence:
-            if item['type'] == 'video':
-                vid_path = download_drive_video(item['id'])
-                cleanup_files.append(vid_path)
-                clip = VideoFileClip(vid_path).resize(newsize=(1280, 720))
-                clips.append(clip)
-            elif item['type'] == 'image':
-                clip = ImageClip(item['path']).set_duration(2).resize(newsize=(1280, 720))
-                clips.append(clip)
+        
+        for word in glosses:
+            # Search
+            res = find_file_in_folder(word, ROOT_FOLDER_ID)
+            
+            if res:
+                # Video found
+                path = download_video(res['id'])
+                if path:
+                    clip = VideoFileClip(path).resize(newsize=(1280, 720))
+                    clips.append(clip)
+            else:
+                # Image fallback
+                path = create_placeholder(word)
+                if path:
+                    clip = ImageClip(path).set_duration(2).resize(newsize=(1280, 720))
+                    clips.append(clip)
 
         if not clips:
-            return jsonify({"error": "No content found"}), 400
+            return jsonify({"error": "No clips found"}), 400
 
-        final_clip = concatenate_videoclips(clips, method="compose")
-        output_path = tempfile.mktemp(suffix=".mp4")
-        cleanup_files.append(output_path)
+        final = concatenate_videoclips(clips, method="compose")
+        output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         
-        final_clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac', temp_audiofile='temp-audio.m4a', remove_temp=True)
-
-        return send_file(output_path, mimetype='video/mp4')
+        # Write file
+        final.write_videofile(output, fps=24, codec='libx264', audio_codec='aac', remove_temp=True)
+        
+        return send_file(output, mimetype='video/mp4')
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-    
-    finally:
-        pass
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
