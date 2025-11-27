@@ -3,10 +3,8 @@ flask-cors
 google-generativeai
 google-api-python-client
 google-auth
-google-auth-oauthlib
 google-auth-httplib2
+google-auth-oauthlib
 moviepy==1.0.3
-Pillow==9.5.0
-numpy<2.0
-pandas
+numpy<2.0.0
 gunicorn
